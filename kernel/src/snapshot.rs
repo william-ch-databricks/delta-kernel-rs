@@ -28,6 +28,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
+use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
 use crate::utils::require;
 use crate::LogCompactionWriter;
@@ -618,6 +619,24 @@ impl Snapshot {
     /// Create a [`ScanBuilder`] for an `SnapshotRef`.
     pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
         ScanBuilder::new(self)
+    }
+
+    /// Create an [`AlterTableTransactionBuilder`] for evolving the schema of this table.
+    ///
+    /// Returns a builder that accepts schema operations (add column, drop column, rename column,
+    /// set nullable) and produces a metadata-only commit when built and committed.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let result = snapshot
+    ///     .alter_table()
+    ///     .add_column(StructField::nullable("email", DataType::STRING))
+    ///     .build(engine, committer)?
+    ///     .commit(engine)?;
+    /// ```
+    pub fn alter_table(self: Arc<Self>) -> AlterTableTransactionBuilder {
+        AlterTableTransactionBuilder::new(self)
     }
 
     /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].

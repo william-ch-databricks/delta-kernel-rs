@@ -173,6 +173,7 @@ impl CreateTableTransaction {
             is_blind_append: false,
             dv_matched_files: vec![],
             clustering_columns_physical: clustering_columns,
+            evolved_metadata: None,
             _state: PhantomData,
         })
     }

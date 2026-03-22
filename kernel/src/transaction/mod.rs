@@ -10,7 +10,7 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
+    DomainMetadata, Metadata, SetTransaction, METADATA_NAME, PROTOCOL_NAME,
 };
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::crc::{CrcDelta, FileStatsDelta};
@@ -35,6 +35,11 @@ use crate::{
     RowVisitor, Version, PRE_COMMIT_VERSION,
 };
 use delta_kernel_derive::internal_api;
+
+#[cfg(feature = "internal-api")]
+pub mod alter_table;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod alter_table;
 
 #[cfg(feature = "internal-api")]
 pub mod builder;
@@ -229,6 +234,9 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     clustering_columns_physical: Option<Vec<ColumnName>>,
+    // Evolved metadata for ALTER TABLE commits. When Some, commit() emits this as a Metadata
+    // action. None for ExistingTable and CreateTable transactions.
+    evolved_metadata: Option<Metadata>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -267,7 +275,7 @@ impl<S> Transaction<S> {
         ),
         err
     )]
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
+    pub fn commit(mut self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         info!(
             num_add_files = self.add_files_metadata.len(),
             num_remove_files = self.remove_files_metadata.len(),
@@ -339,7 +347,9 @@ impl<S> Transaction<S> {
         );
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
-        // Step 3: Generate Protocol and Metadata actions for create-table
+        // Step 3: Generate Protocol and Metadata actions for create-table or alter-table
+        // Stash evolved metadata for CRC before taking it for engine data conversion.
+        let evolved_metadata_for_crc = self.evolved_metadata.clone();
         let (protocol_action, metadata_action) = if self.is_create_table() {
             let table_config = self.read_snapshot.table_configuration();
             let protocol = table_config.protocol().clone();
@@ -352,6 +362,11 @@ impl<S> Transaction<S> {
             let metadata_data = metadata.into_engine_data(metadata_schema, engine)?;
 
             (Some(protocol_data), Some(metadata_data))
+        } else if let Some(evolved_metadata) = self.evolved_metadata.take() {
+            // ALTER TABLE: emit evolved metadata only (no protocol change)
+            let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
+            let metadata_data = evolved_metadata.into_engine_data(metadata_schema, engine)?;
+            (None, Some(metadata_data))
         } else {
             (None, None)
         };
@@ -416,7 +431,11 @@ impl<S> Transaction<S> {
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
             Ok(CommitResponse::Committed { file_meta }) => {
-                let crc_delta = self.build_crc_delta(in_commit_timestamp, dm_changes)?;
+                let crc_delta = self.build_crc_delta(
+                    in_commit_timestamp,
+                    dm_changes,
+                    evolved_metadata_for_crc,
+                )?;
                 Ok(CommitResult::CommittedTransaction(
                     self.into_committed(file_meta, crc_delta)?,
                 ))
@@ -786,22 +805,31 @@ impl<S> Transaction<S> {
     }
 
     /// Build a [`CrcDelta`] from the transaction's staged file metadata and commit state.
+    /// The `evolved_metadata` parameter carries the evolved metadata for ALTER TABLE commits,
+    /// which must be stashed before `self.evolved_metadata.take()` in `commit()`.
     fn build_crc_delta(
         &self,
         in_commit_timestamp: Option<i64>,
         dm_changes: Vec<DomainMetadata>,
+        evolved_metadata: Option<Metadata>,
     ) -> DeltaResult<CrcDelta> {
         let file_stats = FileStatsDelta::try_compute_for_txn(
             &self.add_files_metadata,
             &self.remove_files_metadata,
         )?;
         let is_create = self.is_create_table();
+        // For create-table, metadata comes from the pre-commit snapshot configuration.
+        // For alter-table, metadata is the evolved version passed in.
+        let metadata = if is_create {
+            Some(self.read_snapshot.table_configuration().metadata().clone())
+        } else {
+            evolved_metadata
+        };
         Ok(CrcDelta {
             file_stats,
             protocol: is_create
                 .then(|| self.read_snapshot.table_configuration().protocol().clone()),
-            metadata: is_create
-                .then(|| self.read_snapshot.table_configuration().metadata().clone()),
+            metadata,
             domain_metadata_changes: dm_changes,
             set_transaction_changes: self.set_transactions.clone(),
             in_commit_timestamp,
@@ -925,7 +953,8 @@ impl<S> Transaction<S> {
 // =============================================================================
 
 /// Marker trait for transaction states that allow data file operations (add/remove files,
-/// write context, statistics).
+/// write context, statistics). [`AlterTable`](alter_table::AlterTable) transactions do not
+/// implement this trait because schema evolution commits are metadata-only.
 pub trait SupportsDataFiles {}
 impl SupportsDataFiles for ExistingTable {}
 impl SupportsDataFiles for CreateTable {}

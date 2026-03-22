@@ -27,6 +27,12 @@ use crate::{DeltaResult, Engine, Error};
 pub(crate) enum SchemaOperation {
     /// Add a new top-level column.
     AddColumn { field: StructField },
+    /// Drop a column by name. Requires column mapping.
+    DropColumn { name: String },
+    /// Rename a column. Requires column mapping mode = name.
+    RenameColumn { old_name: String, new_name: String },
+    /// Widen a column's nullability from NOT NULL to nullable.
+    SetNullable { name: String },
 }
 
 /// Result of applying schema operations to a table schema.
@@ -98,6 +104,73 @@ impl AlterTableTransactionBuilder {
         self
     }
 
+    /// Drop a column from the table schema.
+    ///
+    /// Requires column mapping to be enabled (mode = name or id). The column is removed from
+    /// the logical schema but physical data in existing Parquet files is untouched -- it simply
+    /// becomes unreferenced.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name of the column to drop. Must be a top-level column name matching a field
+    ///   in the current schema.
+    ///
+    /// # Errors (at build time)
+    ///
+    /// - Column does not exist in the current schema
+    /// - Column mapping is not enabled on the table
+    /// - Column is a partition column
+    pub fn drop_column(mut self, name: impl Into<String>) -> Self {
+        self.operations
+            .push(SchemaOperation::DropColumn { name: name.into() });
+        self
+    }
+
+    /// Rename a column in the table schema.
+    ///
+    /// Requires column mapping mode = name. Only the logical name changes; the physical name
+    /// and column ID remain the same, so existing data files are unaffected.
+    ///
+    /// # Arguments
+    ///
+    /// * `old_name` - Current name of the column
+    /// * `new_name` - New name for the column
+    ///
+    /// # Errors (at build time)
+    ///
+    /// - Column `old_name` does not exist
+    /// - Column mapping mode is not `name`
+    /// - `new_name` conflicts with an existing column at the same level
+    /// - Column is a partition column
+    pub fn rename_column(
+        mut self,
+        old_name: impl Into<String>,
+        new_name: impl Into<String>,
+    ) -> Self {
+        self.operations.push(SchemaOperation::RenameColumn {
+            old_name: old_name.into(),
+            new_name: new_name.into(),
+        });
+        self
+    }
+
+    /// Widen a column's nullability from NOT NULL to nullable.
+    ///
+    /// Only the safe direction is allowed: NOT NULL -> nullable.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name of the column to make nullable
+    ///
+    /// # Errors (at build time)
+    ///
+    /// - Column does not exist
+    pub fn set_nullable(mut self, name: impl Into<String>) -> Self {
+        self.operations
+            .push(SchemaOperation::SetNullable { name: name.into() });
+        self
+    }
+
     /// Builds an [`AlterTableTransaction`] that can be committed to evolve the schema.
     ///
     /// This method:
@@ -138,6 +211,7 @@ impl AlterTableTransactionBuilder {
 
         let schema = table_config.logical_schema();
         let column_mapping_mode = table_config.column_mapping_mode();
+        let partition_columns: Vec<String> = table_config.partition_columns().to_vec();
 
         // Parse current max column ID from table properties
         let current_max_column_id: i64 = table_config
@@ -153,6 +227,7 @@ impl AlterTableTransactionBuilder {
             &self.operations,
             column_mapping_mode,
             current_max_column_id,
+            &partition_columns,
         )?;
 
         // Build evolved metadata
@@ -191,6 +266,8 @@ impl AlterTableTransactionBuilder {
 /// * `operations` - Ordered list of schema operations to apply
 /// * `column_mapping_mode` - The table's column mapping mode
 /// * `current_max_column_id` - Current `delta.columnMapping.maxColumnId` value
+/// * `partition_columns` - Partition column names (some operations are restricted)
+///
 /// # Errors
 ///
 /// Returns an error if any operation fails validation. The error message identifies which
@@ -200,6 +277,7 @@ pub(crate) fn apply_schema_operations(
     operations: &[SchemaOperation],
     column_mapping_mode: ColumnMappingMode,
     current_max_column_id: i64,
+    partition_columns: &[String],
 ) -> DeltaResult<SchemaEvolutionResult> {
     let mut evolving_schema: StructType = schema.as_ref().clone();
     let mut max_column_id = current_max_column_id;
@@ -232,6 +310,101 @@ pub(crate) fn apply_schema_operations(
 
                 // Append the new field at the end of the schema
                 evolving_schema = evolving_schema.with_field_inserted_after(None, new_field)?;
+            }
+            SchemaOperation::DropColumn { name } => {
+                // Require column mapping for drop
+                if column_mapping_mode == ColumnMappingMode::None {
+                    return Err(Error::generic(format!(
+                        "Cannot drop column '{}': column mapping must be enabled to drop columns",
+                        name
+                    )));
+                }
+
+                // Validate column exists
+                if evolving_schema.field(name).is_none() {
+                    return Err(Error::generic(format!(
+                        "Cannot drop column '{}': column does not exist in the schema",
+                        name
+                    )));
+                }
+
+                // Partition columns cannot be dropped
+                if partition_columns.contains(name) {
+                    return Err(Error::generic(format!(
+                        "Cannot drop column '{}': partition columns cannot be dropped",
+                        name
+                    )));
+                }
+
+                evolving_schema = evolving_schema.with_field_removed(name);
+            }
+            SchemaOperation::RenameColumn { old_name, new_name } => {
+                // Require column mapping mode = Name for rename
+                if column_mapping_mode != ColumnMappingMode::Name {
+                    return Err(Error::generic(format!(
+                        "Cannot rename column '{}': column mapping mode must be 'name' to \
+                         rename columns (current mode: {:?})",
+                        old_name, column_mapping_mode
+                    )));
+                }
+
+                // Partition columns cannot be renamed (partition_columns stores names by value)
+                if partition_columns.contains(old_name) {
+                    return Err(Error::generic(format!(
+                        "Cannot rename column '{}': partition columns cannot be renamed",
+                        old_name
+                    )));
+                }
+
+                // Validate old column exists and get it
+                let old_field = evolving_schema.field(old_name).ok_or_else(|| {
+                    Error::generic(format!(
+                        "Cannot rename column '{}': column does not exist in the schema",
+                        old_name
+                    ))
+                })?;
+
+                // Validate new name doesn't conflict
+                if evolving_schema.field(new_name).is_some() {
+                    return Err(Error::generic(format!(
+                        "Cannot rename column '{}' to '{}': a column with name '{}' already exists",
+                        old_name, new_name, new_name
+                    )));
+                }
+
+                let renamed_field = old_field.with_name(new_name);
+
+                // Rebuild the schema to get the correct field name as IndexMap key.
+                // with_field_replaced only updates the value but keeps the old key.
+                let new_fields: Vec<StructField> = evolving_schema
+                    .fields()
+                    .map(|f| {
+                        if f.name() == old_name {
+                            renamed_field.clone()
+                        } else {
+                            f.clone()
+                        }
+                    })
+                    .collect();
+                evolving_schema = StructType::try_new(new_fields)?;
+            }
+            SchemaOperation::SetNullable { name } => {
+                // Validate column exists
+                let field = evolving_schema.field(name).ok_or_else(|| {
+                    Error::generic(format!(
+                        "Cannot set nullable on column '{}': column does not exist in the schema",
+                        name
+                    ))
+                })?;
+
+                // Only NOT NULL -> nullable is allowed; if already nullable, this is a no-op
+                if field.is_nullable() {
+                    continue;
+                }
+
+                let mut nullable_field = field.clone();
+                nullable_field.nullable = true;
+                evolving_schema = evolving_schema.with_field_replaced(name, nullable_field)?;
             }
         }
     }
@@ -335,7 +508,7 @@ mod tests {
             field: StructField::nullable("email", DataType::STRING),
         }];
 
-        let result = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0)
+        let result = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0, &[])
             .expect("add_column should succeed");
 
         assert_eq!(result.schema.num_fields(), 4);
@@ -355,7 +528,7 @@ mod tests {
             field: StructField::nullable("email", DataType::STRING),
         }];
 
-        let result = apply_schema_operations(&schema, &ops, ColumnMappingMode::Name, 3)
+        let result = apply_schema_operations(&schema, &ops, ColumnMappingMode::Name, 3, &[])
             .expect("add_column should succeed");
 
         assert_eq!(result.schema.num_fields(), 4);
@@ -385,7 +558,7 @@ mod tests {
             field: StructField::nullable("name", DataType::STRING),
         }];
 
-        let err = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0)
+        let err = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0, &[])
             .expect_err("duplicate column should fail");
         assert!(err.to_string().contains("already exists"));
     }
@@ -397,15 +570,197 @@ mod tests {
             field: StructField::new("email", DataType::STRING, false),
         }];
 
-        let err = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0)
+        let err = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0, &[])
             .expect_err("non-nullable should fail");
         assert!(err.to_string().contains("non-nullable"));
     }
 
     #[test]
+    fn drop_column_with_column_mapping() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::DropColumn {
+            name: "age".to_string(),
+        }];
+        let result = apply_schema_operations(&schema, &ops, ColumnMappingMode::Name, 3, &[])
+            .expect("drop_column should succeed");
+        assert_eq!(result.schema.num_fields(), 2);
+        assert!(result.schema.field("age").is_none());
+    }
+
+    #[test]
+    fn drop_column_without_column_mapping_fails() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::DropColumn {
+            name: "age".to_string(),
+        }];
+        let err = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0, &[])
+            .expect_err("drop without column mapping should fail");
+        assert!(err.to_string().contains("column mapping must be enabled"));
+    }
+
+    #[test]
+    fn drop_nonexistent_column_fails() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::DropColumn {
+            name: "nonexistent".to_string(),
+        }];
+        let err = apply_schema_operations(&schema, &ops, ColumnMappingMode::Name, 3, &[])
+            .expect_err("drop nonexistent should fail");
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn drop_partition_column_fails() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::DropColumn {
+            name: "name".to_string(),
+        }];
+        let err = apply_schema_operations(
+            &schema,
+            &ops,
+            ColumnMappingMode::Name,
+            3,
+            &["name".to_string()],
+        )
+        .expect_err("drop partition column should fail");
+        assert!(err
+            .to_string()
+            .contains("partition columns cannot be dropped"));
+    }
+
+    #[test]
+    fn rename_column_with_name_mode() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            old_name: "name".to_string(),
+            new_name: "full_name".to_string(),
+        }];
+        let result = apply_schema_operations(&schema, &ops, ColumnMappingMode::Name, 3, &[])
+            .expect("rename should succeed");
+        assert_eq!(result.schema.num_fields(), 3);
+        assert!(result.schema.field("name").is_none());
+        let renamed = result
+            .schema
+            .field("full_name")
+            .expect("renamed field should exist");
+        assert_eq!(renamed.data_type(), &DataType::STRING);
+        assert!(renamed.is_nullable());
+    }
+
+    #[test]
+    fn rename_column_without_name_mode_fails() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            old_name: "name".to_string(),
+            new_name: "full_name".to_string(),
+        }];
+        let err = apply_schema_operations(&schema, &ops, ColumnMappingMode::Id, 3, &[])
+            .expect_err("rename without name mode should fail");
+        assert!(err
+            .to_string()
+            .contains("column mapping mode must be 'name'"));
+    }
+
+    #[test]
+    fn rename_to_existing_name_fails() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            old_name: "name".to_string(),
+            new_name: "age".to_string(),
+        }];
+        let err = apply_schema_operations(&schema, &ops, ColumnMappingMode::Name, 3, &[])
+            .expect_err("rename to existing name should fail");
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn rename_partition_column_fails() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::RenameColumn {
+            old_name: "name".to_string(),
+            new_name: "full_name".to_string(),
+        }];
+        let err = apply_schema_operations(
+            &schema,
+            &ops,
+            ColumnMappingMode::Name,
+            3,
+            &["name".to_string()],
+        )
+        .expect_err("rename partition column should fail");
+        assert!(err
+            .to_string()
+            .contains("partition columns cannot be renamed"));
+    }
+
+    #[test]
+    fn set_nullable_on_not_null_column() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::SetNullable {
+            name: "id".to_string(),
+        }];
+        let result = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0, &[])
+            .expect("set_nullable should succeed");
+        let id_field = result.schema.field("id").expect("id should exist");
+        assert!(id_field.is_nullable());
+    }
+
+    #[test]
+    fn set_nullable_on_already_nullable_is_noop() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::SetNullable {
+            name: "name".to_string(),
+        }];
+        let result = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0, &[])
+            .expect("set_nullable on nullable should succeed (noop)");
+        let name_field = result.schema.field("name").expect("name should exist");
+        assert!(name_field.is_nullable());
+    }
+
+    #[test]
+    fn set_nullable_nonexistent_column_fails() {
+        let schema = test_schema();
+        let ops = vec![SchemaOperation::SetNullable {
+            name: "nonexistent".to_string(),
+        }];
+        let err = apply_schema_operations(&schema, &ops, ColumnMappingMode::None, 0, &[])
+            .expect_err("set_nullable on nonexistent should fail");
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn chained_operations() {
+        let schema = test_schema();
+        let ops = vec![
+            SchemaOperation::AddColumn {
+                field: StructField::nullable("email", DataType::STRING),
+            },
+            SchemaOperation::DropColumn {
+                name: "age".to_string(),
+            },
+            SchemaOperation::RenameColumn {
+                old_name: "name".to_string(),
+                new_name: "full_name".to_string(),
+            },
+            SchemaOperation::SetNullable {
+                name: "id".to_string(),
+            },
+        ];
+        let result = apply_schema_operations(&schema, &ops, ColumnMappingMode::Name, 3, &[])
+            .expect("chained operations should succeed");
+        assert_eq!(result.schema.num_fields(), 3);
+        assert!(result.schema.field("id").is_some());
+        assert!(result.schema.field("full_name").is_some());
+        assert!(result.schema.field("email").is_some());
+        assert!(result.schema.field("name").is_none());
+        assert!(result.schema.field("age").is_none());
+        assert!(result.schema.field("id").unwrap().is_nullable());
+    }
+
+    #[test]
     fn empty_operations_succeeds_at_schema_level() {
         let schema = test_schema();
-        let result = apply_schema_operations(&schema, &[], ColumnMappingMode::None, 0)
+        let result = apply_schema_operations(&schema, &[], ColumnMappingMode::None, 0, &[])
             .expect("empty ops should succeed at schema level");
         assert_eq!(result.schema.num_fields(), 3);
     }

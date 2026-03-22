@@ -50,6 +50,14 @@ fn two_column_schema() -> DeltaResult<Arc<StructType>> {
     ])?))
 }
 
+fn three_column_schema() -> DeltaResult<Arc<StructType>> {
+    Ok(Arc::new(StructType::try_new(vec![
+        StructField::new("id", DataType::INTEGER, false),
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("age", DataType::INTEGER),
+    ])?))
+}
+
 const COLUMN_MAPPING_NAME: [(&str, &str); 1] = [("delta.columnMapping.mode", "name")];
 
 #[tokio::test]
@@ -291,6 +299,164 @@ async fn alter_table_commit_log_contains_metadata_action() -> DeltaResult<()> {
         log_content.contains("\"commitInfo\""),
         "commit log should contain commitInfo"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_set_nullable() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let (table_url, snapshot) =
+        create_test_table(&table_path, engine.as_ref(), two_column_schema()?, &[])?;
+
+    let _ = snapshot
+        .alter_table()
+        .set_nullable("id")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?;
+
+    let snapshot = load_snapshot(&table_url, engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+    let evolved_schema = snapshot.schema();
+    let id_field = evolved_schema.field("id").expect("id field should exist");
+    assert!(id_field.is_nullable(), "id should now be nullable");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_drop_column() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let (table_url, snapshot) = create_test_table(
+        &table_path,
+        engine.as_ref(),
+        three_column_schema()?,
+        &COLUMN_MAPPING_NAME,
+    )?;
+
+    let _ = snapshot
+        .alter_table()
+        .drop_column("age")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?;
+
+    let snapshot = load_snapshot(&table_url, engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+    let evolved_schema = snapshot.schema();
+    assert_eq!(evolved_schema.num_fields(), 2);
+    assert!(evolved_schema.field("id").is_some());
+    assert!(evolved_schema.field("name").is_some());
+    assert!(
+        evolved_schema.field("age").is_none(),
+        "age should be removed"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_rename_column() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let (table_url, snapshot) = create_test_table(
+        &table_path,
+        engine.as_ref(),
+        two_column_schema()?,
+        &COLUMN_MAPPING_NAME,
+    )?;
+
+    let _ = snapshot
+        .alter_table()
+        .rename_column("name", "full_name")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?;
+
+    let snapshot = load_snapshot(&table_url, engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+    let evolved_schema = snapshot.schema();
+    assert_eq!(evolved_schema.num_fields(), 2);
+    assert!(evolved_schema.field("name").is_none());
+    assert!(evolved_schema.field("full_name").is_some());
+
+    let full_name_field = evolved_schema.field("full_name").unwrap();
+    assert!(
+        full_name_field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .is_some(),
+        "renamed column should preserve its physical name"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_drop_without_column_mapping_rejected() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let (_table_url, snapshot) =
+        create_test_table(&table_path, engine.as_ref(), two_column_schema()?, &[])?;
+
+    let result = snapshot
+        .alter_table()
+        .drop_column("name")
+        .build(engine.as_ref(), committer());
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("column mapping must be enabled"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_rename_without_column_mapping_rejected() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let (_table_url, snapshot) =
+        create_test_table(&table_path, engine.as_ref(), two_column_schema()?, &[])?;
+
+    let result = snapshot
+        .alter_table()
+        .rename_column("name", "full_name")
+        .build(engine.as_ref(), committer());
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("column mapping mode must be 'name'"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_chained_operations() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let (table_url, snapshot) = create_test_table(
+        &table_path,
+        engine.as_ref(),
+        three_column_schema()?,
+        &COLUMN_MAPPING_NAME,
+    )?;
+
+    let _ = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("email", DataType::STRING))
+        .drop_column("age")
+        .rename_column("name", "full_name")
+        .set_nullable("id")
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?;
+
+    let snapshot = load_snapshot(&table_url, engine.as_ref())?;
+    assert_eq!(snapshot.version(), 1);
+    let evolved_schema = snapshot.schema();
+    assert_eq!(evolved_schema.num_fields(), 3); // id, full_name, email
+
+    let id_field = evolved_schema.field("id").expect("id should exist");
+    assert!(id_field.is_nullable(), "id should be nullable");
+
+    assert!(evolved_schema.field("full_name").is_some());
+    assert!(evolved_schema.field("email").is_some());
+    assert!(evolved_schema.field("name").is_none());
+    assert!(evolved_schema.field("age").is_none());
 
     Ok(())
 }

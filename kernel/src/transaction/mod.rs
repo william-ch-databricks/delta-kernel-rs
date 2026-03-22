@@ -588,168 +588,6 @@ impl<S> Transaction<S> {
         self.read_snapshot.version().wrapping_add(1)
     }
 
-    /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
-    /// a Parquet write operation back to Kernel.
-    ///
-    /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
-    /// for constructing an add_file. Each row represents metadata about a
-    /// file to be added to the table. Kernel takes this information and extends it to the full add_file
-    /// action schema, adding internal fields (e.g., baseRowID) as necessary.
-    ///
-    /// The `stats` field contains file-level statistics. The schema returned here shows the base
-    /// structure; the actual stats written by [`DefaultEngine::write_parquet`] include dynamically
-    /// computed fields (numRecords, nullCount, minValues, maxValues, tightBounds) based on the
-    /// data schema and table configuration. See [`stats_schema`] for the table-specific expected
-    /// stats schema.
-    ///
-    /// Note: While currently static, in the future the schema might change depending on
-    /// options set on the transaction or features enabled on the table.
-    ///
-    /// [`add_files`]: crate::transaction::Transaction::add_files
-    /// [`ParquetHandler`]: crate::ParquetHandler
-    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
-    /// [`stats_schema`]: Transaction::stats_schema
-    pub fn add_files_schema(&self) -> &'static SchemaRef {
-        &BASE_ADD_FILES_SCHEMA
-    }
-
-    /// Returns the expected schema for file statistics.
-    ///
-    /// The schema structure is derived from table configuration:
-    /// - `delta.dataSkippingStatsColumns`: Explicit column list (if set)
-    /// - `delta.dataSkippingNumIndexedCols`: Column count limit (default 32)
-    /// - Partition columns: Always excluded
-    ///
-    /// The returned schema has the following structure:
-    /// ```ignore
-    /// {
-    ///   numRecords: long,
-    ///   nullCount: { ... },   // Nested struct mirroring data schema, all fields LONG
-    ///   minValues: { ... },   // Nested struct, only min/max eligible types
-    ///   maxValues: { ... },   // Nested struct, only min/max eligible types
-    ///   tightBounds: boolean,
-    /// }
-    /// ```
-    ///
-    /// Engines should collect statistics matching this schema structure when writing files.
-    ///
-    /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
-    /// in statistics, regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols`
-    /// settings.
-    #[allow(unused)]
-    pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let tc = self.read_snapshot.table_configuration();
-        let stats_schemas =
-            tc.build_expected_stats_schemas(self.clustering_columns_physical.as_deref(), None)?;
-        Ok(stats_schemas.physical)
-    }
-
-    /// Returns the list of column names that should have statistics collected.
-    ///
-    /// This returns leaf column paths as [`ColumnName`] objects. Each `ColumnName`
-    /// stores path components separately (e.g., `ColumnName::new(["nested", "field"])`).
-    /// See [`ColumnName`'s `Display` implementation][ColumnName#impl-Display-for-ColumnName]
-    /// for details on string formatting and escaping.
-    ///
-    /// Engines can use this to determine which columns need stats during writes.
-    ///
-    /// Per the Delta protocol, clustering columns are always included in statistics,
-    /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
-    #[allow(unused)]
-    pub fn stats_columns(&self) -> Vec<ColumnName> {
-        self.read_snapshot
-            .table_configuration()
-            .stats_column_names_physical(self.clustering_columns_physical.as_deref())
-    }
-
-    // Generate the logical-to-physical transform expression which must be evaluated on every data
-    // chunk before writing. At the moment, this is a transaction-wide expression.
-    fn generate_logical_to_physical(&self) -> Expression {
-        let partition_cols = self
-            .read_snapshot
-            .table_configuration()
-            .partition_columns()
-            .to_vec();
-        // Check if materializePartitionColumns feature is enabled
-        let materialize_partition_columns = self
-            .read_snapshot
-            .table_configuration()
-            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-        // Build a Transform expression that drops partition columns from the input
-        // (unless materializePartitionColumns is enabled).
-        let mut transform = Transform::new_top_level();
-        if !materialize_partition_columns {
-            for col in &partition_cols {
-                transform = transform.with_dropped_field_if_exists(col);
-            }
-        }
-        Expression::transform(transform)
-    }
-
-    /// Get the write context for this transaction. At the moment, this is constant for the whole
-    /// transaction.
-    // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
-    // that engines cannot call this method after a metadata change, since the write context could
-    // have invalid metadata.
-    // Note: Callers that use get_write_context may be writing data to the table and they might
-    // have invalid metadata.
-    pub fn get_write_context(&self) -> WriteContext {
-        let target_dir = self.read_snapshot.table_root();
-        let snapshot_schema = self.read_snapshot.schema();
-        let logical_to_physical = self.generate_logical_to_physical();
-        let column_mapping_mode = self
-            .read_snapshot
-            .table_configuration()
-            .column_mapping_mode();
-
-        // Compute physical schema: exclude partition columns since they're stored in the path
-        // (unless materializePartitionColumns is enabled), and apply column mapping to transform
-        // logical field names to physical names.
-        let partition_columns: Vec<String> = self
-            .read_snapshot
-            .table_configuration()
-            .partition_columns()
-            .to_vec();
-        let materialize_partition_columns = self
-            .read_snapshot
-            .table_configuration()
-            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
-        let physical_fields = snapshot_schema
-            .fields()
-            .filter(|f| {
-                materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
-            })
-            .map(|f| {
-                // NOTE: This should never fail, as schema was already validated during TableConfiguration construction.
-                f.make_physical(column_mapping_mode).unwrap_or_else(|e| {
-                    warn!("make_physical failed: {e}");
-                    f.clone()
-                })
-            });
-        let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
-
-        // Get stats columns from table configuration
-        let stats_columns = self.stats_columns();
-
-        WriteContext::new(
-            target_dir.clone(),
-            snapshot_schema,
-            physical_schema,
-            Arc::new(logical_to_physical),
-            column_mapping_mode,
-            stats_columns,
-        )
-    }
-
-    /// Add files to include in this transaction. This API generally enables the engine to
-    /// add/append/insert data (files) to the table. Note that this API can be called multiple times
-    /// to add multiple batches.
-    ///
-    /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
-    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
-        self.add_files_metadata.push(add_metadata);
-    }
-
     /// Validate that add files have required statistics for clustering columns.
     ///
     /// Per the Delta protocol, writers MUST collect per-file statistics for clustering columns
@@ -894,7 +732,7 @@ impl<S> Transaction<S> {
             let add_actions = build_add_actions(
                 engine,
                 extended_add_files,
-                with_row_tracking_cols(self.add_files_schema()),
+                with_row_tracking_cols(&BASE_ADD_FILES_SCHEMA),
                 with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
                 self.data_change,
             );
@@ -909,7 +747,7 @@ impl<S> Transaction<S> {
             let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
-                self.add_files_schema().clone(),
+                BASE_ADD_FILES_SCHEMA.clone(),
                 with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
                 self.data_change,
             );
@@ -1079,6 +917,180 @@ impl<S> Transaction<S> {
                 file_metadata_batch.selection_vector().to_vec(),
             )
         }))
+    }
+}
+
+// =============================================================================
+// SupportsDataFiles: methods available only on transaction types that allow data file operations
+// =============================================================================
+
+/// Marker trait for transaction states that allow data file operations (add/remove files,
+/// write context, statistics).
+pub trait SupportsDataFiles {}
+impl SupportsDataFiles for ExistingTable {}
+impl SupportsDataFiles for CreateTable {}
+
+impl<S: SupportsDataFiles> Transaction<S> {
+    /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting
+    /// information about a Parquet write operation back to Kernel.
+    ///
+    /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it
+    /// is the base for constructing an add_file. Each row represents metadata about a file to be
+    /// added to the table. Kernel takes this information and extends it to the full add_file
+    /// action schema, adding internal fields (e.g., baseRowID) as necessary.
+    ///
+    /// The `stats` field contains file-level statistics. The schema returned here shows the base
+    /// structure; the actual stats written by [`DefaultEngine::write_parquet`] include dynamically
+    /// computed fields (numRecords, nullCount, minValues, maxValues, tightBounds) based on the
+    /// data schema and table configuration. See [`stats_schema`] for the table-specific expected
+    /// stats schema.
+    ///
+    /// Note: While currently static, in the future the schema might change depending on
+    /// options set on the transaction or features enabled on the table.
+    ///
+    /// [`add_files`]: crate::transaction::Transaction::add_files
+    /// [`ParquetHandler`]: crate::ParquetHandler
+    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
+    /// [`stats_schema`]: Transaction::stats_schema
+    pub fn add_files_schema(&self) -> &'static SchemaRef {
+        &BASE_ADD_FILES_SCHEMA
+    }
+
+    /// Returns the expected schema for file statistics.
+    ///
+    /// The schema structure is derived from table configuration:
+    /// - `delta.dataSkippingStatsColumns`: Explicit column list (if set)
+    /// - `delta.dataSkippingNumIndexedCols`: Column count limit (default 32)
+    /// - Partition columns: Always excluded
+    ///
+    /// The returned schema has the following structure:
+    /// ```ignore
+    /// {
+    ///   numRecords: long,
+    ///   nullCount: { ... },   // Nested struct mirroring data schema, all fields LONG
+    ///   minValues: { ... },   // Nested struct, only min/max eligible types
+    ///   maxValues: { ... },   // Nested struct, only min/max eligible types
+    ///   tightBounds: boolean,
+    /// }
+    /// ```
+    ///
+    /// Engines should collect statistics matching this schema structure when writing files.
+    ///
+    /// Per the Delta protocol, required columns (e.g. clustering columns) are always included
+    /// in statistics, regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols`
+    /// settings.
+    #[allow(unused)]
+    pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
+        let tc = self.read_snapshot.table_configuration();
+        let stats_schemas =
+            tc.build_expected_stats_schemas(self.clustering_columns_physical.as_deref(), None)?;
+        Ok(stats_schemas.physical)
+    }
+
+    /// Returns the list of column names that should have statistics collected.
+    ///
+    /// This returns leaf column paths as [`ColumnName`] objects. Each `ColumnName`
+    /// stores path components separately (e.g., `ColumnName::new(["nested", "field"])`).
+    /// See [`ColumnName`'s `Display` implementation][ColumnName#impl-Display-for-ColumnName]
+    /// for details on string formatting and escaping.
+    ///
+    /// Engines can use this to determine which columns need stats during writes.
+    ///
+    /// Per the Delta protocol, clustering columns are always included in statistics,
+    /// regardless of `dataSkippingStatsColumns` or `dataSkippingNumIndexedCols` settings.
+    #[allow(unused)]
+    pub fn stats_columns(&self) -> Vec<ColumnName> {
+        self.read_snapshot
+            .table_configuration()
+            .stats_column_names_physical(self.clustering_columns_physical.as_deref())
+    }
+
+    // Generate the logical-to-physical transform expression which must be evaluated on every data
+    // chunk before writing. At the moment, this is a transaction-wide expression.
+    fn generate_logical_to_physical(&self) -> Expression {
+        let partition_cols = self
+            .read_snapshot
+            .table_configuration()
+            .partition_columns()
+            .to_vec();
+        // Check if materializePartitionColumns feature is enabled
+        let materialize_partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
+        // Build a Transform expression that drops partition columns from the input
+        // (unless materializePartitionColumns is enabled).
+        let mut transform = Transform::new_top_level();
+        if !materialize_partition_columns {
+            for col in &partition_cols {
+                transform = transform.with_dropped_field_if_exists(col);
+            }
+        }
+        Expression::transform(transform)
+    }
+
+    /// Get the write context for this transaction. At the moment, this is constant for the whole
+    /// transaction.
+    // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
+    // that engines cannot call this method after a metadata change, since the write context could
+    // have invalid metadata.
+    // Note: Callers that use get_write_context may be writing data to the table and they might
+    // have invalid metadata.
+    pub fn get_write_context(&self) -> WriteContext {
+        let target_dir = self.read_snapshot.table_root();
+        let snapshot_schema = self.read_snapshot.schema();
+        let logical_to_physical = self.generate_logical_to_physical();
+        let column_mapping_mode = self
+            .read_snapshot
+            .table_configuration()
+            .column_mapping_mode();
+
+        // Compute physical schema: exclude partition columns since they're stored in the path
+        // (unless materializePartitionColumns is enabled), and apply column mapping to transform
+        // logical field names to physical names.
+        let partition_columns: Vec<String> = self
+            .read_snapshot
+            .table_configuration()
+            .partition_columns()
+            .to_vec();
+        let materialize_partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
+        let physical_fields = snapshot_schema
+            .fields()
+            .filter(|f| {
+                materialize_partition_columns || !partition_columns.contains(&f.name().to_string())
+            })
+            .map(|f| {
+                // NOTE: This should never fail, as schema was already validated during TableConfiguration construction.
+                f.make_physical(column_mapping_mode).unwrap_or_else(|e| {
+                    warn!("make_physical failed: {e}");
+                    f.clone()
+                })
+            });
+        let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
+
+        // Get stats columns from table configuration
+        let stats_columns = self.stats_columns();
+
+        WriteContext::new(
+            target_dir.clone(),
+            snapshot_schema,
+            physical_schema,
+            Arc::new(logical_to_physical),
+            column_mapping_mode,
+            stats_columns,
+        )
+    }
+
+    /// Add files to include in this transaction. This API generally enables the engine to
+    /// add/append/insert data (files) to the table. Note that this API can be called multiple times
+    /// to add multiple batches.
+    ///
+    /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
+    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
+        self.add_files_metadata.push(add_metadata);
     }
 }
 
@@ -1691,7 +1703,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file<S>(txn: &mut Transaction<S>) {
+    fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
         let data = string_array_to_engine_data(StringArray::from(vec!["dummy"]));
         txn.add_files(data);
     }
